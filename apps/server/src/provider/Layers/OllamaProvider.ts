@@ -37,8 +37,10 @@ export const checkOllamaProviderStatus = (ollamaSettings: OllamaSettings, proces
 
   // Version is non-critical: a failed probe must not crash the whole status
   // check before ollamaListModels (which carries its own error snapshot).
+  // Ollama Cloud reports a placeholder "0.0.0" — treat it as no version.
   const versionExit = yield* Effect.exit(ollamaVersion(baseUrl, apiKey));
-  const version = Exit.isSuccess(versionExit) ? versionExit.value : "";
+  const rawVersion = Exit.isSuccess(versionExit) ? versionExit.value : "";
+  const version = rawVersion === "0.0.0" ? "" : rawVersion;
   const modelsExit = yield* Effect.exit(ollamaListModels(baseUrl, apiKey));
 
   if (Exit.isFailure(modelsExit)) {
