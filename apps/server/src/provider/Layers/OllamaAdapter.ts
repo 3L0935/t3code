@@ -182,7 +182,9 @@ export const makeOllamaAdapter = (
         });
 
         // Captured by the ollamaChat catch below and read in onExit to tell a
-        // real provider error apart from a fiber interruption.
+        // real provider error apart from a fiber interruption. This relies on
+        // ollamaChat being the loop's ONLY fallible step — keep it that way,
+        // or onExit will misclassify an interruption as a failure.
         let turnError: OllamaRuntimeError | undefined;
 
         const runTurnLoop = Effect.gen(function* () {
