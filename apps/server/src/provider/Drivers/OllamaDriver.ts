@@ -45,7 +45,7 @@ export const OllamaDriver: ProviderDriver<OllamaSettings, OllamaDriverEnv> = {
       const adapter = yield* makeOllamaAdapter(effectiveConfig, processEnv, { instanceId });
       const textGeneration = yield* makeOllamaTextGeneration(effectiveConfig, processEnv);
 
-      const checkProvider = checkOllamaProviderStatus(effectiveConfig).pipe(Effect.map(stampIdentity));
+      const checkProvider = checkOllamaProviderStatus(effectiveConfig, processEnv).pipe(Effect.map(stampIdentity));
       const snapshot = yield* makeManagedServerProvider<OllamaSettings>({
         maintenanceCapabilities: { provider: DRIVER_KIND, packageName: null, update: null },
         getSettings: Effect.succeed(effectiveConfig),

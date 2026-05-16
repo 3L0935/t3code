@@ -46,6 +46,9 @@ interface OllamaSessionContext {
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   activeModel: string;
   activeTurnId: TurnId | undefined;
+  activeFiber: Fiber.RuntimeFiber<unknown, unknown> | undefined;
+  /** message count at the start of each turn (indexed by turn number, 0 = before first user message) */
+  readonly turnMessageIndices: number[];
 }
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -81,6 +84,12 @@ export const makeOllamaAdapter = (
 
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
+        for (const [, context] of sessions) {
+          if (context.activeFiber) {
+            yield* Ref.set(context.stopped, true);
+            yield* Fiber.interrupt(context.activeFiber);
+          }
+        }
         sessions.clear();
         yield* Queue.shutdown(runtimeEvents);
       }),
@@ -118,6 +127,8 @@ export const makeOllamaAdapter = (
           pendingApprovals: new Map(),
           activeModel: effectiveModel,
           activeTurnId: undefined,
+          activeFiber: undefined,
+          turnMessageIndices: [0],
         });
         return session;
       },
@@ -291,7 +302,8 @@ export const makeOllamaAdapter = (
           });
         });
 
-        runFork(runTurnLoop);
+        const fiber = runFork(runTurnLoop);
+        context.activeFiber = fiber;
         return { threadId: input.threadId, turnId } satisfies ProviderTurnStartResult;
       },
     );
@@ -369,7 +381,13 @@ export const makeOllamaAdapter = (
         if (!context) {
           return yield* new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId });
         }
-        context.messages.splice(context.messages.length - numTurns * 2, numTurns * 2);
+        // Use per-turn message indices to correctly handle turns with tool calls
+        const indices = context.turnMessageIndices;
+        if (indices.length <= 1 || numTurns <= 0) return { threadId, turns: [] };
+        const targetTurn = Math.max(0, indices.length - 1 - numTurns);
+        const rollbackIndex = indices[targetTurn]!;
+        context.messages.splice(rollbackIndex);
+        context.turnMessageIndices.splice(targetTurn + 1);
         return { threadId, turns: [] };
       },
     );

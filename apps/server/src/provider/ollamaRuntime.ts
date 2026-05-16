@@ -108,23 +108,27 @@ export const ollamaChat = (input: {
       ...(input.options ? { options: input.options } : {}),
     };
     let response: Response;
-    try {
-      response = yield* Effect.promise(() =>
+    response = yield* Effect.tryPromise({
+      try: () =>
         fetch(`${input.baseUrl}/api/chat`, {
           method: "POST",
           headers: buildHeaders(input.apiKey),
           body: JSON.stringify(body),
           signal: input.signal ?? null,
         }),
-      );
-    } catch (cause) {
-      return yield* fail("ollamaChat", String(cause), cause);
-    }
+      catch: (cause) => new OllamaRuntimeError({ operation: "ollamaChat", detail: String(cause), cause }),
+    });
     if (!response.ok) {
-      const text = yield* Effect.promise(() => response.text());
+      const text = yield* Effect.tryPromise({
+        try: () => response.text(),
+        catch: (cause) => new OllamaRuntimeError({ operation: "ollamaChat.text", detail: String(cause), cause }),
+      });
       return yield* fail("ollamaChat", `Ollama /api/chat returned status ${response.status}: ${text}`);
     }
-    const json = (yield* Effect.promise(() => response.json())) as Record<string, unknown>;
+    const json = (yield* Effect.tryPromise({
+      try: () => response.json(),
+      catch: (cause) => new OllamaRuntimeError({ operation: "ollamaChat.json", detail: String(cause), cause }),
+    })) as Record<string, unknown>;
     if (
       typeof json.model !== "string" ||
       typeof json.message !== "object" || !json.message ||
@@ -172,26 +176,27 @@ export const ollamaChatStream = (input: {
         ...(input.options ? { options: input.options } : {}),
       };
       let responseBody: ReadableStream<Uint8Array>;
-      try {
-        const response = yield* Effect.promise(() =>
+      const response = yield* Effect.tryPromise({
+        try: () =>
           fetch(`${input.baseUrl}/api/chat`, {
             method: "POST",
             headers: buildHeaders(input.apiKey),
             body: JSON.stringify(body),
             signal: input.signal ?? null,
           }),
-        );
-        if (!response.ok) {
-          const text = yield* Effect.promise(() => response.text());
-          return yield* fail("ollamaChatStream", `Ollama /api/chat stream returned status ${response.status}: ${text}`);
-        }
-        if (!response.body) {
-          return yield* fail("ollamaChatStream", "Ollama response body is null.");
-        }
-        responseBody = response.body;
-      } catch (cause) {
-        return yield* fail("ollamaChatStream", String(cause), cause);
+        catch: (cause) => new OllamaRuntimeError({ operation: "ollamaChatStream", detail: String(cause), cause }),
+      });
+      if (!response.ok) {
+        const text = yield* Effect.tryPromise({
+          try: () => response.text(),
+          catch: (cause) => new OllamaRuntimeError({ operation: "ollamaChatStream.text", detail: String(cause), cause }),
+        });
+        return yield* fail("ollamaChatStream", `Ollama /api/chat stream returned status ${response.status}: ${text}`);
       }
+      if (!response.body) {
+        return yield* fail("ollamaChatStream", "Ollama response body is null.");
+      }
+      responseBody = response.body;
       return Stream.fromAsyncIterable(
         lineByLine(responseBody),
         (cause) =>
@@ -225,6 +230,9 @@ async function* lineByLine(stream: ReadableStream<Uint8Array>): AsyncGenerator<s
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
+        // Flush any remaining multi-byte characters in the decoder's internal buffer
+        const flush = decoder.decode();
+        if (flush.length > 0) buffer += flush;
         if (buffer.length > 0) yield buffer;
         return;
       }
@@ -244,19 +252,21 @@ async function* lineByLine(stream: ReadableStream<Uint8Array>): AsyncGenerator<s
 
 export const ollamaListModels = (baseUrl: string, apiKey?: string) =>
   Effect.gen(function* () {
-    let response: Response;
-    try {
-      response = yield* Effect.promise(() =>
-        fetch(`${baseUrl}/api/tags`, { headers: buildHeaders(apiKey) }),
-      );
-    } catch (cause) {
-      return yield* fail("ollamaListModels", String(cause), cause);
-    }
+    const response = yield* Effect.tryPromise({
+      try: () => fetch(`${baseUrl}/api/tags`, { headers: buildHeaders(apiKey) }),
+      catch: (cause) => new OllamaRuntimeError({ operation: "ollamaListModels", detail: String(cause), cause }),
+    });
     if (!response.ok) {
-      const text = yield* Effect.promise(() => response.text());
+      const text = yield* Effect.tryPromise({
+        try: () => response.text(),
+        catch: (cause) => new OllamaRuntimeError({ operation: "ollamaListModels.text", detail: String(cause), cause }),
+      });
       return yield* fail("ollamaListModels", `Ollama /api/tags returned status ${response.status}: ${text}`);
     }
-    const json = (yield* Effect.promise(() => response.json())) as Record<string, unknown>;
+    const json = (yield* Effect.tryPromise({
+      try: () => response.json(),
+      catch: (cause) => new OllamaRuntimeError({ operation: "ollamaListModels.json", detail: String(cause), cause }),
+    })) as Record<string, unknown>;
     if (!json || typeof json !== "object" || !Array.isArray(json.models)) {
       return yield* fail("ollamaListModels", "Ollama /api/tags returned unexpected response shape.", json);
     }
@@ -272,14 +282,14 @@ export const ollamaListModels = (baseUrl: string, apiKey?: string) =>
 
 export const ollamaVersion = (baseUrl: string, apiKey?: string) =>
   Effect.gen(function* () {
-    try {
-      const response = yield* Effect.promise(() =>
-        fetch(`${baseUrl}/api/version`, { headers: buildHeaders(apiKey) }),
-      );
-      if (!response.ok) return "";
-      const json = (yield* Effect.promise(() => response.json())) as Record<string, unknown>;
-      return typeof json.version === "string" ? json.version : "";
-    } catch {
-      return "";
-    }
+    const response = yield* Effect.tryPromise({
+      try: () => fetch(`${baseUrl}/api/version`, { headers: buildHeaders(apiKey) }),
+      catch: () => new OllamaRuntimeError({ operation: "ollamaVersion", detail: "Failed to reach Ollama /api/version" }),
+    });
+    if (!response.ok) return "";
+    const json = (yield* Effect.tryPromise({
+      try: () => response.json(),
+      catch: () => new OllamaRuntimeError({ operation: "ollamaVersion.json", detail: "Failed to parse /api/version response" }),
+    })) as Record<string, unknown>;
+    return typeof json.version === "string" ? json.version : "";
   });

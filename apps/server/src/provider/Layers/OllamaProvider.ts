@@ -24,12 +24,11 @@ export const makePendingOllamaProvider = (
     return buildServerProvider({ presentation: OLLAMA_PRESENTATION, enabled: true, checkedAt, models, probe: { installed: false, version: null, status: "warning", auth: { status: "unknown" }, message: "Ollama status has not been checked yet." } });
   });
 
-export const checkOllamaProviderStatus = Effect.fn("checkOllamaProviderStatus")(function* (
-  ollamaSettings: OllamaSettings,
-) {
+export const checkOllamaProviderStatus = (ollamaSettings: OllamaSettings, processEnv: Record<string, string | undefined>) =>
+  Effect.gen(function* () {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   const baseUrl = ollamaSettings.baseUrl;
-  const apiKey = process.env.OLLAMA_API_KEY;
+  const apiKey = processEnv.OLLAMA_API_KEY;
   const customModels = ollamaSettings.customModels;
 
   if (!ollamaSettings.enabled) {
