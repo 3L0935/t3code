@@ -1,6 +1,7 @@
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Random from "effect/Random";
@@ -140,14 +141,22 @@ export const makeOllamaAdapter = (
         if (!context) {
           return yield* new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId: input.threadId });
         }
-        // Clear any interrupt flag left by a previous interruptTurn so the
-        // session stays usable. stopSession deletes the session entirely,
-        // so a closed session is already caught by the not-found check above.
-        yield* Ref.set(context.stopped, false);
         const text = input.input?.trim();
         if (!text || text.length === 0) {
           return yield* new ProviderAdapterValidationError({ provider: PROVIDER, operation: "sendTurn", issue: "Ollama turns require text input." });
         }
+        // A previous turn's fiber must be fully terminated before a new turn
+        // starts, otherwise two fibers would mutate context.messages
+        // concurrently. Fiber.interrupt awaits the fiber's onExit, so the
+        // prior turn is fully closed (turn.completed emitted) once this returns.
+        if (context.activeFiber) {
+          yield* Fiber.interrupt(context.activeFiber);
+          context.activeFiber = undefined;
+        }
+        // Clear any interrupt flag from a previous interruptTurn; stopSession
+        // deletes the session entirely, so a closed session is already caught
+        // by the not-found check above.
+        yield* Ref.set(context.stopped, false);
         const model = input.modelSelection?.model ?? context.activeModel;
         context.activeModel = model;
         const turnId = TurnId.make(`ollama-turn-${yield* Random.nextUUIDv4}`);
@@ -172,6 +181,10 @@ export const makeOllamaAdapter = (
           payload: { model },
         });
 
+        // Captured by the ollamaChat catch below and read in onExit to tell a
+        // real provider error apart from a fiber interruption.
+        let turnError: OllamaRuntimeError | undefined;
+
         const runTurnLoop = Effect.gen(function* () {
           let looping = true;
           while (looping) {
@@ -184,23 +197,10 @@ export const makeOllamaAdapter = (
               messages: context.messages,
               tools: OLLAMA_TOOL_DEFINITIONS,
             }).pipe(
-              Effect.catch((error: OllamaRuntimeError) =>
-                Effect.gen(function* () {
-                  context.activeTurnId = undefined;
-                  context.session = { ...context.session, status: "error", lastError: error.detail } as ProviderSession;
-                  yield* emit({
-                    ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
-                    type: "turn.completed",
-                    payload: { state: "failed", errorMessage: error.detail },
-                  });
-                  yield* emit({
-                    ...(yield* buildEventBase({ threadId: input.threadId })),
-                    type: "runtime.error",
-                    payload: { message: error.detail, class: "provider_error" },
-                  });
-                  return yield* Effect.fail(error);
-                }),
-              ),
+              Effect.catch((error: OllamaRuntimeError) => {
+                turnError = error;
+                return Effect.fail(error);
+              }),
             );
 
             const toolCalls = response.message.tool_calls;
@@ -299,17 +299,38 @@ export const makeOllamaAdapter = (
               looping = false;
             }
           }
-
-          const isStopped = yield* Ref.get(context.stopped);
-          context.activeTurnId = undefined;
-          context.activeFiber = undefined;
-          context.session = { ...context.session, status: "ready" } as ProviderSession;
-          yield* emit({
-            ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
-            type: "turn.completed",
-            payload: { state: isStopped ? "interrupted" : "completed" },
-          });
-        });
+        }).pipe(
+          // onExit runs whether the loop completes, fails, or is interrupted,
+          // so turn.completed is emitted exactly once on every path.
+          Effect.onExit((exit) =>
+            Effect.gen(function* () {
+              context.activeTurnId = undefined;
+              context.activeFiber = undefined;
+              if (Exit.isFailure(exit) && turnError) {
+                context.session = { ...context.session, status: "error", lastError: turnError.detail } as ProviderSession;
+                yield* emit({
+                  ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+                  type: "turn.completed",
+                  payload: { state: "failed", errorMessage: turnError.detail },
+                });
+                yield* emit({
+                  ...(yield* buildEventBase({ threadId: input.threadId })),
+                  type: "runtime.error",
+                  payload: { message: turnError.detail, class: "provider_error" },
+                });
+              } else {
+                // Failure without turnError means the fiber was interrupted.
+                const isStopped = yield* Ref.get(context.stopped);
+                context.session = { ...context.session, status: "ready" } as ProviderSession;
+                yield* emit({
+                  ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+                  type: "turn.completed",
+                  payload: { state: isStopped || Exit.isFailure(exit) ? "interrupted" : "completed" },
+                });
+              }
+            }),
+          ),
+        );
 
         const fiber = runFork(runTurnLoop);
         context.activeFiber = fiber;
@@ -326,8 +347,12 @@ export const makeOllamaAdapter = (
             yield* Deferred.succeed(pending.decision, "cancel");
           }
           context.pendingApprovals.clear();
-          context.activeTurnId = undefined;
-          context.session = { ...context.session, status: "ready" } as ProviderSession;
+          // Interrupt the running fiber and await its termination. The fiber's
+          // onExit clears activeTurnId/activeFiber and emits turn.completed.
+          if (context.activeFiber) {
+            yield* Fiber.interrupt(context.activeFiber);
+            context.activeFiber = undefined;
+          }
         }
       },
     );
