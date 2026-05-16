@@ -35,7 +35,10 @@ export const checkOllamaProviderStatus = (ollamaSettings: OllamaSettings, proces
     return buildServerProvider({ presentation: OLLAMA_PRESENTATION, enabled: false, checkedAt, models: providerModelsFromSettings([], PROVIDER, customModels, DEFAULT_CAPABILITIES), probe: { installed: false, version: null, status: "warning", auth: { status: "unknown" }, message: "Ollama is disabled." } });
   }
 
-  const version = yield* ollamaVersion(baseUrl, apiKey);
+  // Version is non-critical: a failed probe must not crash the whole status
+  // check before ollamaListModels (which carries its own error snapshot).
+  const versionExit = yield* Effect.exit(ollamaVersion(baseUrl, apiKey));
+  const version = Exit.isSuccess(versionExit) ? versionExit.value : "";
   const modelsExit = yield* Effect.exit(ollamaListModels(baseUrl, apiKey));
 
   if (Exit.isFailure(modelsExit)) {

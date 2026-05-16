@@ -272,7 +272,7 @@ export const ollamaListModels = (baseUrl: string, apiKey?: string) =>
     }
     return (json.models as Array<Record<string, unknown>>).map((m) => ({
       name: String(m.name ?? ""),
-      modifiedAt: String(m.modifiedAt ?? ""),
+      modifiedAt: String(m.modified_at ?? m.modifiedAt ?? ""),
       size: typeof m.size === "number" ? m.size : 0,
       digest: String(m.digest ?? ""),
     })) satisfies ReadonlyArray<OllamaModelInfo>;

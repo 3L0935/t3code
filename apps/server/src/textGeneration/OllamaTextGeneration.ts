@@ -37,7 +37,12 @@ export const makeOllamaTextGeneration = Effect.fn("makeOllamaTextGeneration")(fu
         ),
       );
     }).pipe(
-      Effect.mapError((cause) => new TextGenerationError({ operation: input.operation, detail: cause instanceof Error ? cause.message : String(cause), cause })),
+      // Only the ollamaChat call produces a foreign error; the empty-output and
+      // schema-decode paths already fail with TextGenerationError, so catching
+      // by tag avoids double-wrapping them.
+      Effect.catchTag("OllamaRuntimeError", (cause) =>
+        Effect.fail(new TextGenerationError({ operation: input.operation, detail: cause.detail, cause })),
+      ),
     );
 
   return {

@@ -25,7 +25,7 @@ import {
 } from "@t3tools/contracts";
 
 import type { OllamaAdapterShape } from "../Services/OllamaAdapter.ts";
-import { ProviderAdapterRequestError, ProviderAdapterSessionClosedError, ProviderAdapterSessionNotFoundError, ProviderAdapterValidationError } from "../Errors.ts";
+import { ProviderAdapterRequestError, ProviderAdapterSessionNotFoundError, ProviderAdapterValidationError } from "../Errors.ts";
 import { ollamaChat, type OllamaChatMessage, type OllamaRuntimeError } from "../ollamaRuntime.js";
 import { OLLAMA_TOOL_DEFINITIONS, executeOllamaTool, classifyOllamaToolItemType, classifyOllamaRequestType, summarizeOllamaToolCall } from "../OllamaTools.js";
 
@@ -46,7 +46,7 @@ interface OllamaSessionContext {
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   activeModel: string;
   activeTurnId: TurnId | undefined;
-  activeFiber: Fiber.RuntimeFiber<unknown, unknown> | undefined;
+  activeFiber: Fiber.Fiber<unknown, unknown> | undefined;
   /** message count at the start of each turn (indexed by turn number, 0 = before first user message) */
   readonly turnMessageIndices: number[];
 }
@@ -140,9 +140,10 @@ export const makeOllamaAdapter = (
         if (!context) {
           return yield* new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId: input.threadId });
         }
-        if (yield* Ref.get(context.stopped)) {
-          return yield* new ProviderAdapterSessionClosedError({ provider: PROVIDER, threadId: input.threadId });
-        }
+        // Clear any interrupt flag left by a previous interruptTurn so the
+        // session stays usable. stopSession deletes the session entirely,
+        // so a closed session is already caught by the not-found check above.
+        yield* Ref.set(context.stopped, false);
         const text = input.input?.trim();
         if (!text || text.length === 0) {
           return yield* new ProviderAdapterValidationError({ provider: PROVIDER, operation: "sendTurn", issue: "Ollama turns require text input." });
@@ -151,6 +152,13 @@ export const makeOllamaAdapter = (
         context.activeModel = model;
         const turnId = TurnId.make(`ollama-turn-${yield* Random.nextUUIDv4}`);
         context.activeTurnId = turnId;
+        // Record this turn's start boundary in the message array so
+        // rollbackThread can splice whole turns (incl. tool messages),
+        // regardless of whether the turn later succeeds or fails.
+        const lastIndex = context.turnMessageIndices[context.turnMessageIndices.length - 1];
+        if (lastIndex !== context.messages.length) {
+          context.turnMessageIndices.push(context.messages.length);
+        }
         context.messages.push({ role: "user", content: text });
         context.session = { ...context.session, status: "running", activeTurnId: turnId } as ProviderSession;
         const cwd = context.session.cwd ?? process.cwd();
@@ -294,6 +302,7 @@ export const makeOllamaAdapter = (
 
           const isStopped = yield* Ref.get(context.stopped);
           context.activeTurnId = undefined;
+          context.activeFiber = undefined;
           context.session = { ...context.session, status: "ready" } as ProviderSession;
           yield* emit({
             ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
@@ -353,6 +362,10 @@ export const makeOllamaAdapter = (
             yield* Deferred.succeed(pending.decision, "cancel");
           }
           context.pendingApprovals.clear();
+          if (context.activeFiber) {
+            yield* Fiber.interrupt(context.activeFiber);
+            context.activeFiber = undefined;
+          }
           sessions.delete(threadId);
         }
       },
@@ -381,13 +394,14 @@ export const makeOllamaAdapter = (
         if (!context) {
           return yield* new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId });
         }
-        // Use per-turn message indices to correctly handle turns with tool calls
+        // turnMessageIndices holds the message-array offset at the start of
+        // each turn, so a rollback splices whole turns (incl. tool messages).
         const indices = context.turnMessageIndices;
-        if (indices.length <= 1 || numTurns <= 0) return { threadId, turns: [] };
-        const targetTurn = Math.max(0, indices.length - 1 - numTurns);
-        const rollbackIndex = indices[targetTurn]!;
+        if (numTurns <= 0 || indices.length === 0) return { threadId, turns: [] };
+        const keepTurns = Math.max(0, indices.length - numTurns);
+        const rollbackIndex = indices[keepTurns] ?? indices[0] ?? 0;
         context.messages.splice(rollbackIndex);
-        context.turnMessageIndices.splice(targetTurn + 1);
+        context.turnMessageIndices.splice(keepTurns);
         return { threadId, turns: [] };
       },
     );
