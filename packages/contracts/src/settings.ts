@@ -855,7 +855,41 @@ export const UsageLimitSourceConfig = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
 });
 export type UsageLimitSourceConfig = typeof UsageLimitSourceConfig.Type;
-
+export const OllamaSettings = makeProviderSettingsSchema(
+  {
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    baseUrl: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("http://localhost:11434")),
+      Schema.annotateKey({
+        title: "Ollama server URL",
+        description: "URL of the Ollama server. Local (http://localhost:11434) or cloud (https://ollama.com). API key via OLLAMA_API_KEY env variable.",
+        providerSettingsForm: {
+          placeholder: "http://localhost:11434",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    model: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Default model",
+        description: "Default model slug. Overridden by per-session model selection.",
+        providerSettingsForm: { placeholder: "qwen2.5:7b", clearWhenEmpty: "omit" },
+      }),
+    ),
+    customModels: Schema.Array(Schema.String).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+  },
+  {
+    order: ["baseUrl", "model"],
+  },
+);
+export type OllamaSettings = typeof OllamaSettings.Type;
 export const ObservabilitySettings = Schema.Struct({
   otlpTracesUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
   otlpMetricsUrl: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
@@ -1044,7 +1078,7 @@ export const ServerSettings = Schema.Struct({
     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     antigravity: AntigravitySettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
-  }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+    ollama: OllamaSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // New driver-agnostic instance map. Keyed by `ProviderInstanceId`; values
   // are `ProviderInstanceConfig` envelopes. The driver-specific config blob
   // is `Schema.Unknown` at this layer so envelopes with unknown drivers
@@ -1216,6 +1250,13 @@ const OpenCodeSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
 });
 
+const OllamaSettingsPatch = Schema.Struct({
+  enabled: Schema.optionalKey(Schema.Boolean),
+  baseUrl: Schema.optionalKey(TrimmedString),
+  model: Schema.optionalKey(TrimmedString),
+  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+
 export const ServerSettingsPatch = Schema.Struct({
   // Server settings
   enableLegacyTokenStreaming: Schema.optionalKey(Schema.Boolean),
@@ -1274,7 +1315,7 @@ export const ServerSettingsPatch = Schema.Struct({
       grok: Schema.optionalKey(GrokSettingsPatch),
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
       antigravity: Schema.optionalKey(AntigravitySettingsPatch),
-    }),
+      ollama: Schema.optionalKey(OllamaSettingsPatch),
   ),
   // Whole-map replacement for the new instance config. Patching individual
   // entries is intentionally out of scope: the map is small, and partial

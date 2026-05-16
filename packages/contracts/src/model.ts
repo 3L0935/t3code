@@ -148,6 +148,7 @@ const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER_KIND = ProviderDriverKind.make("cursor");
 const GROK_DRIVER_KIND = ProviderDriverKind.make("grok");
 const OPENCODE_DRIVER_KIND = ProviderDriverKind.make("opencode");
+const OLLAMA_DRIVER_KIND = ProviderDriverKind.make("ollama");
 
 export const DEFAULT_MODEL = "gpt-5.6-sol";
 
@@ -173,7 +174,7 @@ export const DEFAULT_MODEL_BY_PROVIDER: Partial<Record<ProviderDriverKind, strin
   [GROK_DRIVER_KIND]: "grok-build",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
   [ProviderDriverKind.make("antigravity")]: ANTIGRAVITY_DEFAULT_MODEL,
-};
+  [OLLAMA_DRIVER_KIND]: "llama3.2",
 
 /** Per-provider text generation model defaults. */
 export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
@@ -184,6 +185,7 @@ export const DEFAULT_TEXT_GENERATION_MODEL_BY_PROVIDER: Partial<
   [CLAUDE_DRIVER_KIND]: "claude-haiku-4-5",
   [CURSOR_DRIVER_KIND]: "composer-2",
   [OPENCODE_DRIVER_KIND]: "openai/gpt-5",
+  [OLLAMA_DRIVER_KIND]: "llama3.2",
 };
 
 export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
@@ -210,6 +212,7 @@ export const MODEL_SLUG_ALIASES_BY_PROVIDER: Partial<
     "opus-4.5": "claude-opus-4-5",
   },
   [OPENCODE_DRIVER_KIND]: {},
+  [OLLAMA_DRIVER_KIND]: {},
 };
 
 // ── Provider display names ────────────────────────────────────────────
@@ -221,4 +224,5 @@ export const PROVIDER_DISPLAY_NAMES: Partial<Record<ProviderDriverKind, string>>
   [CURSOR_DRIVER_KIND]: "Cursor",
   [GROK_DRIVER_KIND]: "Grok",
   [OPENCODE_DRIVER_KIND]: "OpenCode",
+  [OLLAMA_DRIVER_KIND]: "Ollama",
 };
