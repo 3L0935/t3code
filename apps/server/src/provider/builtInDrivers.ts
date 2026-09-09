@@ -38,10 +38,9 @@ export type BuiltInDriversEnv =
   | CodexDriverEnv
   | CursorDriverEnv
   | GrokDriverEnv
+  | OllamaDriverEnv
   | OpenCodeDriverEnv
   | AntigravityDriverEnv;
-  | OllamaDriverEnv
-  | OpenCodeDriverEnv;
 /**
  * Ordered list of built-in drivers. Order matters only for tie-breaking in
  * UI presentation — the registry itself is keyed by `driverKind`, so

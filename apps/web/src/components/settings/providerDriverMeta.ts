@@ -14,10 +14,10 @@ import {
   CursorIcon,
   GrokIcon,
   type Icon,
+  OllamaIcon,
   OpenAI,
   OpenCodeIcon,
 } from "../Icons";
-import { ClaudeAI, CursorIcon, type Icon, OpenAI, OpenCodeIcon, OllamaIcon } from "../Icons";
 type ProviderSettingsSchema = {
   readonly fields: Readonly<Record<string, Schema.Top>>;
 } & Schema.Top;
@@ -81,10 +81,13 @@ const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = [
     label: "Antigravity",
     icon: AntigravityIcon,
     settingsSchema: AntigravitySettings,
+  },
+  {
     value: ProviderDriverKind.make("ollama"),
     label: "Ollama",
     icon: OllamaIcon,
     settingsSchema: OllamaSettings,
+  },
 ];
 
 const PROVIDER_CLIENT_DEFINITION_BY_VALUE: Partial<
