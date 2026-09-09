@@ -1,12 +1,14 @@
 import * as DateTime from "effect/DateTime";
+import * as Crypto from "effect/Crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
-import * as Random from "effect/Random";
-import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import { HttpClient } from "effect/unstable/http";
 import {
   ApprovalRequestId,
   EventId,
@@ -14,6 +16,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   RuntimeRequestId,
+  TurnTokenUsage,
   type ProviderApprovalDecision,
   type ProviderRuntimeEvent,
   type ProviderSession,
@@ -26,11 +29,29 @@ import {
 } from "@t3tools/contracts";
 
 import type { OllamaAdapterShape } from "../Services/OllamaAdapter.ts";
-import { ProviderAdapterRequestError, ProviderAdapterSessionNotFoundError, ProviderAdapterValidationError } from "../Errors.ts";
-import { ollamaChat, type OllamaChatMessage, type OllamaRuntimeError } from "../ollamaRuntime.js";
-import { OLLAMA_TOOL_DEFINITIONS, executeOllamaTool, classifyOllamaToolItemType, classifyOllamaRequestType, summarizeOllamaToolCall } from "../OllamaTools.js";
+import {
+  ProviderAdapterRequestError,
+  ProviderAdapterSessionNotFoundError,
+  ProviderAdapterValidationError,
+} from "../Errors.ts";
+import { ServerConfig } from "../../config.ts";
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
+import { ollamaChatStream, type OllamaChatMessage, type OllamaRuntimeError } from "../ollamaRuntime.js";
+import {
+  OLLAMA_TOOL_DEFINITIONS,
+  executeOllamaTool,
+  classifyOllamaToolItemType,
+  classifyOllamaRequestType,
+  summarizeOllamaToolCall,
+} from "../OllamaTools.js";
+import { type EventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = ProviderDriverKind.make("ollama");
+
+/** Default model used when neither the session nor settings name one. Kept in
+ * sync with `DEFAULT_MODEL_BY_PROVIDER["ollama"]` in contracts. */
+const FALLBACK_MODEL = "qwen2.5:7b";
 
 interface PendingApproval {
   readonly requestType: string;
@@ -38,12 +59,19 @@ interface PendingApproval {
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
 }
 
+/** Per-turn token usage accumulated from Ollama chunk counters. */
+interface TurnUsageState {
+  promptTokens: number;
+  responseTokens: number;
+  present: boolean;
+}
+
 interface OllamaSessionContext {
   session: ProviderSession;
   readonly threadId: ThreadId;
   readonly messages: OllamaChatMessage[];
   readonly runtimeEvents: Queue.Queue<ProviderRuntimeEvent>;
-  readonly stopped: Ref.Ref<boolean>;
+  readonly stopped: { current: boolean };
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   activeModel: string;
   activeTurnId: TurnId | undefined;
@@ -54,41 +82,29 @@ interface OllamaSessionContext {
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
-const buildEventBase = (input: {
-  readonly threadId: ThreadId;
-  readonly turnId?: TurnId;
-  readonly itemId?: string;
-}) =>
-  Effect.gen(function* () {
-    const uuid = yield* Random.nextUUIDv4;
-    const createdAt = yield* nowIso;
-    return {
-      eventId: EventId.make(uuid),
-      provider: PROVIDER,
-      threadId: input.threadId,
-      createdAt,
-      ...(input.turnId ? { turnId: input.turnId } : {}),
-      ...(input.itemId ? { itemId: RuntimeItemId.make(input.itemId) } : {}),
-    };
-  });
-
 export const makeOllamaAdapter = (
   ollamaSettings: OllamaSettings,
   processEnv: Record<string, string | undefined>,
-  options?: { readonly instanceId?: ProviderInstanceId },
+  options?: {
+    readonly instanceId?: ProviderInstanceId;
+    readonly nativeEventLogger?: EventNdjsonLogger;
+  },
 ) =>
   Effect.gen(function* () {
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("ollama");
     const runtimeEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const sessions = new Map<ThreadId, OllamaSessionContext>();
     const apiKey = processEnv.OLLAMA_API_KEY;
+    const crypto = yield* Effect.service(Crypto.Crypto);
+    const httpClient = yield* HttpClient.HttpClient;
+    const nativeEventLogger = options?.nativeEventLogger;
 
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
         for (const [, context] of sessions) {
           if (context.activeFiber) {
-            yield* Ref.set(context.stopped, true);
-            yield* Fiber.interrupt(context.activeFiber);
+            context.stopped.current = true;
+            yield* Fiber.interrupt(context.activeFiber).pipe(Effect.ignore);
           }
         }
         sessions.clear();
@@ -96,8 +112,47 @@ export const makeOllamaAdapter = (
       }),
     );
 
+    const randomUUIDv4 = crypto.randomUUIDv4.pipe(
+      Effect.mapError(
+        (cause) =>
+          new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "crypto/randomUUIDv4",
+            detail: "Failed to generate Ollama runtime identifier.",
+            cause,
+          }),
+      ),
+    );
+    const makeEventStamp = () =>
+      Effect.all({ eventId: Effect.map(randomUUIDv4, EventId.make), createdAt: nowIso });
+
     const emit = (event: ProviderRuntimeEvent) =>
       Queue.offer(runtimeEvents, event).pipe(Effect.asVoid);
+
+    const logNative = (threadId: ThreadId, method: string, payload: unknown) =>
+      Effect.gen(function* () {
+        if (!nativeEventLogger) return;
+        const observedAt = yield* nowIso;
+        yield* nativeEventLogger.write(
+          {
+            observedAt,
+            event: {
+              id: yield* randomUUIDv4,
+              kind: "notification",
+              provider: PROVIDER,
+              createdAt: observedAt,
+              method,
+              threadId,
+              payload,
+            },
+          },
+          threadId,
+        );
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to write native Ollama event log.", { cause, threadId, method }),
+        ),
+      );
 
     const startSession: OllamaAdapterShape["startSession"] = Effect.fn("startSession")(
       function* (input: ProviderSessionStartInput) {
@@ -106,7 +161,7 @@ export const makeOllamaAdapter = (
         const effectiveModel =
           (input.modelSelection?.model?.trim().length ?? 0) > 0
             ? input.modelSelection!.model
-            : ollamaSettings.model?.trim() || "qwen2.5:7b";
+            : ollamaSettings.model?.trim() || FALLBACK_MODEL;
         const session: ProviderSession = {
           provider: PROVIDER,
           providerInstanceId: boundInstanceId,
@@ -118,13 +173,12 @@ export const makeOllamaAdapter = (
           createdAt,
           updatedAt: createdAt,
         };
-        const stopped = yield* Ref.make(false);
         sessions.set(input.threadId, {
           session,
           threadId: input.threadId,
           messages: [],
           runtimeEvents,
-          stopped,
+          stopped: { current: false },
           pendingApprovals: new Map(),
           activeModel: effectiveModel,
           activeTurnId: undefined,
@@ -156,10 +210,10 @@ export const makeOllamaAdapter = (
         // Clear any interrupt flag from a previous interruptTurn; stopSession
         // deletes the session entirely, so a closed session is already caught
         // by the not-found check above.
-        yield* Ref.set(context.stopped, false);
+        context.stopped.current = false;
         const model = input.modelSelection?.model ?? context.activeModel;
         context.activeModel = model;
-        const turnId = TurnId.make(`ollama-turn-${yield* Random.nextUUIDv4}`);
+        const turnId = TurnId.make(`ollama-turn-${yield* randomUUIDv4}`);
         context.activeTurnId = turnId;
         // Record this turn's start boundary in the message array so
         // rollbackThread can splice whole turns (incl. tool messages),
@@ -168,50 +222,182 @@ export const makeOllamaAdapter = (
         if (lastIndex !== context.messages.length) {
           context.turnMessageIndices.push(context.messages.length);
         }
-        context.messages.push({ role: "user", content: text });
-        context.session = { ...context.session, status: "running", activeTurnId: turnId } as ProviderSession;
+
+        // Image attachments ride on the user message as base64 `images`, the
+        // only attachment channel Ollama supports. File attachments reach the
+        // agent through the path line ProviderService puts in the prompt
+        // (same as Grok).
+        const serverConfigOption = yield* Effect.serviceOption(ServerConfig);
+        const attachmentsDir = Option.isSome(serverConfigOption)
+          ? serverConfigOption.value.attachmentsDir
+          : undefined;
+        const fileSystemOption = yield* Effect.serviceOption(FileSystem.FileSystem);
+        const fileSystem = Option.isSome(fileSystemOption) ? fileSystemOption.value : undefined;
+        const userMessage: { role: "user"; content: string; images?: ReadonlyArray<string> } = { role: "user", content: text };
+        const images: Array<string> = [];
+        for (const attachment of input.attachments ?? []) {
+          if (attachment.type !== "image") continue;
+          if (!attachmentsDir || !fileSystem) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "sendTurn",
+              detail: "Image attachments are unavailable in this runtime.",
+            });
+          }
+          const attachmentPath = resolveAttachmentPath({ attachmentsDir, attachment });
+          if (!attachmentPath) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "sendTurn",
+              detail: `Invalid attachment id '${attachment.id}'.`,
+            });
+          }
+          const bytes = yield* fileSystem.readFile(attachmentPath).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "sendTurn",
+                  detail: "Failed to read attachment file.",
+                  cause,
+                }),
+            ),
+          );
+          images.push(Buffer.from(bytes).toString("base64"));
+        }
+        if (images.length > 0) {
+          userMessage.images = images;
+        }
+        context.messages.push(userMessage);
+        context.session = { ...context.session, status: "running", activeTurnId: turnId, updatedAt: yield* nowIso };
         const cwd = context.session.cwd ?? process.cwd();
         const runtimeMode = context.session.runtimeMode ?? "full-access";
         const runtimeCtx = yield* Effect.context<never>();
         const runFork = Effect.runForkWith(runtimeCtx);
 
         yield* emit({
-          ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
-          type: "turn.started",
+          ...(yield* makeEventStamp()),
+          provider: PROVIDER,
+          providerInstanceId: boundInstanceId,
+          threadId: input.threadId,
+          turnId,
           payload: { model },
+          type: "turn.started",
         });
 
-        // Captured by the ollamaChat catch below and read in onExit to tell a
-        // real provider error apart from a fiber interruption. This relies on
-        // ollamaChat being the loop's ONLY fallible step — keep it that way,
-        // or onExit will misclassify an interruption as a failure.
+        yield* logNative(input.threadId, "ollama/turn/started", { turnId, model });
+
+        // Captured by the ollamaChatStream catch below and read in onExit to
+        // tell a real provider error apart from a fiber interruption. This
+        // relies on the stream call being the loop's ONLY fallible step —
+        // keep it that way, or onExit will misclassify an interruption as a
+        // failure.
         let turnError: OllamaRuntimeError | undefined;
+        // Accumulated across the turn's streaming rounds; read by onExit.
+        const usage: TurnUsageState = { promptTokens: 0, responseTokens: 0, present: false };
 
         const runTurnLoop = Effect.gen(function* () {
+          // Runtime instructions go first, once, before the first user
+          // message — the same context every other harness injects. Re-run
+          // after a rollback stripped the history back to an earlier turn.
+          if (context.messages[0]?.role !== "system") {
+            context.messages.unshift({ role: "system", content: buildRuntimeInstructions({ harness: "Ollama", model }) });
+          }
           let looping = true;
           while (looping) {
-            if (yield* Ref.get(context.stopped)) break;
+            if (context.stopped.current) break;
 
-            const response = yield* ollamaChat({
+            // One streaming completion. Content deltas are emitted as they
+            // arrive; the last chunk carries done + token counters.
+            let assistantItemId: RuntimeItemId | undefined;
+            let assistantDeltaCount = 0;
+            let assistantText = "";
+            let finalMessage: OllamaChatMessage | undefined;
+            const chunkStream = ollamaChatStream({
+              client: httpClient,
               baseUrl: ollamaSettings.baseUrl,
               apiKey,
               model,
               messages: context.messages,
               tools: OLLAMA_TOOL_DEFINITIONS,
             }).pipe(
-              Effect.catch((error: OllamaRuntimeError) => {
+              Stream.catch((error: OllamaRuntimeError) => {
                 turnError = error;
-                return Effect.fail(error);
+                return Stream.fail(error);
               }),
             );
+            yield* Stream.runForEach(chunkStream, (chunk) =>
+              Effect.gen(function* () {
+                  if (typeof chunk.promptEvalCount === "number") usage.promptTokens += chunk.promptEvalCount;
+                  if (typeof chunk.evalCount === "number") usage.responseTokens += chunk.evalCount;
+                  if (chunk.promptEvalCount !== undefined || chunk.evalCount !== undefined) {
+                    usage.present = true;
+                  }
+                  const delta = chunk.message.content ?? "";
+                  if (delta.length > 0 && (!chunk.message.tool_calls || chunk.message.tool_calls.length === 0)) {
+                    if (assistantItemId === undefined) {
+                      assistantItemId = RuntimeItemId.make(`ollama:item:${turnId}:assistant`);
+                      assistantDeltaCount = 0;
+                      assistantText = "";
+                      yield* emit({
+                        ...(yield* makeEventStamp()),
+                        provider: PROVIDER,
+                        providerInstanceId: boundInstanceId,
+                        threadId: input.threadId,
+                        turnId,
+                        itemId: assistantItemId,
+                        type: "item.started",
+                        payload: { itemType: "assistant_message", title: "Assistant message" },
+                      });
+                    }
+                    assistantDeltaCount += 1;
+                    assistantText += delta;
+                    yield* emit({
+                      ...(yield* makeEventStamp()),
+                      provider: PROVIDER,
+                      providerInstanceId: boundInstanceId,
+                      threadId: input.threadId,
+                      turnId,
+                      itemId: assistantItemId,
+                      type: "content.delta",
+                      payload: { streamKind: "assistant_text", delta },
+                    });
+                  }
+                  if (chunk.message.tool_calls && chunk.message.tool_calls.length > 0) {
+                    finalMessage = chunk.message;
+                  }
+                  if (chunk.done) {
+                    if (!finalMessage) finalMessage = chunk.message;
+                  }
+              }),
+            );
+            if (!finalMessage) {
+              // Nothing usable came back this round.
+              break;
+            }
 
-            const toolCalls = response.message.tool_calls;
-            if (toolCalls && toolCalls.length > 0) {
+            if (finalMessage.tool_calls && finalMessage.tool_calls.length > 0) {
+              // Close the open assistant text block before tool calls.
+              if (assistantItemId !== undefined && assistantDeltaCount > 0) {
+                yield* emit({
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
+                  turnId,
+                  itemId: assistantItemId,
+                  type: "item.completed",
+                  payload: { itemType: "assistant_message", status: "completed", title: "Assistant message", detail: assistantText },
+                });
+                assistantItemId = undefined;
+                assistantDeltaCount = 0;
+                assistantText = "";
+              }
               // Append assistant message with tool_calls to history
-              context.messages.push({ role: "assistant", content: response.message.content ?? "", tool_calls: toolCalls });
+              context.messages.push({ role: "assistant", content: finalMessage.content ?? "", tool_calls: finalMessage.tool_calls });
 
-              for (const toolCall of toolCalls) {
-                if (yield* Ref.get(context.stopped)) {
+              for (const toolCall of finalMessage.tool_calls) {
+                if (context.stopped.current) {
                   looping = false;
                   break;
                 }
@@ -221,35 +407,51 @@ export const makeOllamaAdapter = (
                 const itemType = classifyOllamaToolItemType(toolName);
                 const requestType = classifyOllamaRequestType(toolName);
                 const detail = summarizeOllamaToolCall(toolName, toolArgs);
-                const itemId = `ollama:tool:${turnId}:${toolName}:${yield* Random.nextUUIDv4}`;
+                const itemId = `ollama:tool:${turnId}:${toolName}:${yield* randomUUIDv4}`;
 
                 yield* emit({
-                  ...(yield* buildEventBase({ threadId: input.threadId, turnId, itemId })),
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
+                  turnId,
+                  itemId: RuntimeItemId.make(itemId),
                   type: "item.started",
                   payload: { itemType, title: detail },
                 });
 
                 let approved = true;
                 if (runtimeMode !== "full-access") {
-                  const requestId = ApprovalRequestId.make(yield* Random.nextUUIDv4);
+                  const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
                   const decisionDeferred = yield* Deferred.make<ProviderApprovalDecision>();
-                  const pendingApproval: PendingApproval = { requestType, detail, decision: decisionDeferred };
-                  context.pendingApprovals.set(requestId, pendingApproval);
+                  context.pendingApprovals.set(requestId, { requestType, detail, decision: decisionDeferred });
 
                   yield* emit({
-                    ...(yield* buildEventBase({ threadId: input.threadId, turnId, itemId })),
-                    type: "request.opened",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    providerInstanceId: boundInstanceId,
+                    threadId: input.threadId,
+                    turnId,
+                    itemId: RuntimeItemId.make(itemId),
                     requestId: RuntimeRequestId.make(requestId),
+                    type: "request.opened",
                     payload: { requestType, detail, args: { toolName, input: toolArgs } },
                   });
+
+                  yield* logNative(input.threadId, "ollama/approval/requested", { turnId, toolName, requestId });
 
                   const decision = yield* Deferred.await(decisionDeferred);
                   context.pendingApprovals.delete(requestId);
 
                   yield* emit({
-                    ...(yield* buildEventBase({ threadId: input.threadId, turnId, itemId })),
-                    type: "request.resolved",
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    providerInstanceId: boundInstanceId,
+                    threadId: input.threadId,
+                    turnId,
+                    itemId: RuntimeItemId.make(itemId),
                     requestId: RuntimeRequestId.make(requestId),
+                    type: "request.resolved",
                     payload: { requestType, decision },
                   });
 
@@ -257,7 +459,12 @@ export const makeOllamaAdapter = (
                     approved = false;
                     looping = false;
                     yield* emit({
-                      ...(yield* buildEventBase({ threadId: input.threadId, turnId, itemId })),
+                      ...(yield* makeEventStamp()),
+                      provider: PROVIDER,
+                      providerInstanceId: boundInstanceId,
+                      threadId: input.threadId,
+                      turnId,
+                      itemId: RuntimeItemId.make(itemId),
                       type: "item.completed",
                       payload: { itemType, status: "declined", title: detail },
                     });
@@ -267,32 +474,61 @@ export const makeOllamaAdapter = (
 
                 if (approved) {
                   const toolResult = yield* executeOllamaTool(toolCall, cwd).pipe(
+                    Effect.provideService(HttpClient.HttpClient, httpClient),
                     Effect.catch((err) => Effect.succeed(`Error: ${err.detail}`)),
                   );
 
                   context.messages.push({ role: "tool", content: toolResult });
 
                   yield* emit({
-                    ...(yield* buildEventBase({ threadId: input.threadId, turnId, itemId })),
+                    ...(yield* makeEventStamp()),
+                    provider: PROVIDER,
+                    providerInstanceId: boundInstanceId,
+                    threadId: input.threadId,
+                    turnId,
+                    itemId: RuntimeItemId.make(itemId),
                     type: "item.completed",
                     payload: { itemType, status: "completed", title: detail, detail: toolResult.slice(0, 500) || undefined },
                   });
+                  yield* logNative(input.threadId, "ollama/tool/completed", { turnId, toolName, resultLength: toolResult.length });
                 }
               }
             } else {
-              // No tool calls → final assistant message
-              const content = response.message.content ?? "";
+              // No tool calls → final assistant message; streaming deltas
+              // were already emitted above.
+              const content = finalMessage.content ?? "";
               context.messages.push({ role: "assistant", content });
 
-              if (content.length > 0) {
+              if (assistantItemId !== undefined && assistantDeltaCount > 0) {
+                yield* emit({
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
+                  turnId,
+                  itemId: assistantItemId,
+                  type: "item.completed",
+                  payload: { itemType: "assistant_message", status: "completed", title: "Assistant message", detail: assistantText },
+                });
+              } else if (content.length > 0) {
                 const itemId = `ollama:item:${turnId}:assistant`;
                 yield* emit({
-                  ...(yield* buildEventBase({ threadId: input.threadId, turnId, itemId })),
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
+                  turnId,
+                  itemId: RuntimeItemId.make(itemId),
                   type: "content.delta",
                   payload: { streamKind: "assistant_text", delta: content },
                 });
                 yield* emit({
-                  ...(yield* buildEventBase({ threadId: input.threadId, turnId, itemId })),
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
+                  turnId,
+                  itemId: RuntimeItemId.make(itemId),
                   type: "item.completed",
                   payload: { itemType: "assistant_message", status: "completed", title: "Assistant message", detail: content },
                 });
@@ -308,27 +544,53 @@ export const makeOllamaAdapter = (
             Effect.gen(function* () {
               context.activeTurnId = undefined;
               context.activeFiber = undefined;
+              const tokenUsage: TurnTokenUsage = usage.present
+                ? {
+                    usageStatus: "complete",
+                    usageScope: "main_agent",
+                    inputTokens: usage.promptTokens,
+                    outputTokens: usage.responseTokens,
+                    hasSubagents: false,
+                  }
+                : {
+                    usageStatus: "unavailable",
+                    usageScope: "main_agent",
+                    hasSubagents: false,
+                  };
               if (Exit.isFailure(exit) && turnError) {
-                context.session = { ...context.session, status: "error", lastError: turnError.detail } as ProviderSession;
+                context.session = { ...context.session, status: "error", lastError: turnError.detail, updatedAt: yield* nowIso };
                 yield* emit({
-                  ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
+                  turnId,
                   type: "turn.completed",
-                  payload: { state: "failed", errorMessage: turnError.detail },
+                  payload: { state: "failed", errorMessage: turnError.detail, tokenUsage },
                 });
                 yield* emit({
-                  ...(yield* buildEventBase({ threadId: input.threadId })),
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
                   type: "runtime.error",
                   payload: { message: turnError.detail, class: "provider_error" },
                 });
+                yield* logNative(input.threadId, "ollama/turn/failed", { turnId, error: turnError.detail });
               } else {
                 // Failure without turnError means the fiber was interrupted.
-                const isStopped = yield* Ref.get(context.stopped);
-                context.session = { ...context.session, status: "ready" } as ProviderSession;
+                const isStopped = context.stopped.current;
+                context.session = { ...context.session, status: "ready", updatedAt: yield* nowIso };
                 yield* emit({
-                  ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+                  ...(yield* makeEventStamp()),
+                  provider: PROVIDER,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
+                  turnId,
                   type: "turn.completed",
-                  payload: { state: isStopped || Exit.isFailure(exit) ? "interrupted" : "completed" },
+                  payload: { state: isStopped || Exit.isFailure(exit) ? "cancelled" : "completed", tokenUsage },
                 });
+                yield* logNative(input.threadId, "ollama/turn/completed", { turnId, state: isStopped ? "cancelled" : "completed" });
               }
             }),
           ),
@@ -344,7 +606,7 @@ export const makeOllamaAdapter = (
       function* (threadId: ThreadId) {
         const context = sessions.get(threadId);
         if (context) {
-          yield* Ref.set(context.stopped, true);
+          context.stopped.current = true;
           for (const [, pending] of context.pendingApprovals) {
             yield* Deferred.succeed(pending.decision, "cancel");
           }
@@ -384,7 +646,7 @@ export const makeOllamaAdapter = (
       function* (threadId: ThreadId) {
         const context = sessions.get(threadId);
         if (context) {
-          yield* Ref.set(context.stopped, true);
+          context.stopped.current = true;
           for (const [, pending] of context.pendingApprovals) {
             yield* Deferred.succeed(pending.decision, "cancel");
           }
@@ -442,7 +704,7 @@ export const makeOllamaAdapter = (
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session" },
+      capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: true },
       startSession,
       sendTurn,
       interruptTurn,

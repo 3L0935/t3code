@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
+import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 import type { CanonicalItemType, CanonicalRequestType } from "@t3tools/contracts";
 import type { OllamaToolDefinition, OllamaToolCall } from "./ollamaRuntime.js";
 
@@ -173,27 +174,40 @@ function listDirRecursive(dirPath: string, prefix = ""): string[] {
 export const executeOllamaTool = (
   call: OllamaToolCall,
   cwd: string,
-): Effect.Effect<string, OllamaToolError> => {
+): Effect.Effect<string, OllamaToolError, HttpClient.HttpClient> => {
   const name = call.function.name;
   const args = call.function.arguments;
 
   if (name === "web_fetch") {
     const url = String(args.url);
     const maxLength = typeof args.max_length === "number" ? args.max_length : 20_000;
-    return Effect.tryPromise({
-      try: async () => {
-        const response = await fetch(url, {
-          headers: { "User-Agent": "Mozilla/5.0 (compatible; T3Code/1.0)" },
-          signal: AbortSignal.timeout(15_000),
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        const text = await response.text();
-        // Strip HTML tags for readability when content looks like HTML
-        const stripped = text.includes("</") ? text.replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim() : text;
-        return stripped.length > maxLength ? stripped.slice(0, maxLength) + "\n…(truncated)" : stripped;
-      },
-      catch: (cause) => new OllamaToolError({ toolName: name, detail: cause instanceof Error ? cause.message : String(cause), cause }),
-    });
+    return Effect.gen(function* () {
+      const client = yield* HttpClient.HttpClient;
+      const response = yield* client.execute(
+        HttpClientRequest.get(url).pipe(
+          HttpClientRequest.setHeader("User-Agent", "Mozilla/5.0 (compatible; T3Code/1.0)"),
+        ),
+      );
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      const text = yield* response.text;
+      // Strip HTML tags for readability when content looks like HTML
+      const stripped = text.includes("</") ? text.replace(/<[^>]+>/g, " ").replace(/\s{2,}/g, " ").trim() : text;
+      return stripped.length > maxLength ? stripped.slice(0, maxLength) + "\n…(truncated)" : stripped;
+    }).pipe(
+      Effect.timeout(15_000),
+      Effect.catch(
+        (cause: unknown) =>
+          Effect.fail(
+            new OllamaToolError({
+              toolName: name,
+              detail: cause instanceof Error ? cause.message : String(cause),
+              cause,
+            }),
+          ),
+      ),
+    );
   }
 
   return Effect.try({

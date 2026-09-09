@@ -5,6 +5,7 @@ import {
   CursorSettings,
   GrokSettings,
   OllamaSettings,
+  OpenCodeSettings,
   ProviderDriverKind,
 } from "@t3tools/contracts";
 import type * as Schema from "effect/Schema";
